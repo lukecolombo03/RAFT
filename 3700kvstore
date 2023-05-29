@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, random
+
+BROADCAST = "FFFF"
+TIMEOUT_INTERVAL = .250
+HEARTBEAT_INTERVAL = .2
+START = time.time()
+SOCKET = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+SOCKET.bind(('localhost', 0))
+SOCKET.setblocking(False)
+
+
+# static method that sends the given message over the global socket
+def send(message):
+    SOCKET.sendto(json.dumps(message).encode('utf-8'), ('localhost', args.port))
+
+
+# takes in variables and creates and sends a json messages based on them
+# src, dst, leader, and type are required, mid, value, term, and entries are optional
+def better_send(src, dst, leader, type, mid=None, value=None, term=0, prev_index=None, prev_term=None,
+                entries=[], leader_commit=0, success=None, follower_commit=0):
+    message = {"src": src, "dst": dst, "leader": leader, "type": type, "MID": mid, "value": value, "term": term,
+               "entries": entries, "success": success, "prev_index": prev_index, "prev_term": prev_term,
+               "leader_commit": leader_commit, "follower_commit": follower_commit}
+    send(message)
+
+# client messages don't have terms so they won't default to 0
+
+
+state_machine = {}  # dictionary of {key, value} that have been put()
+log = []            # list of (term, new value, old value, key, client, MID)
+current_term = 0    # the terms act as a logical clock to know who's out of date
+commit_index = -1    # index of highest log entry known to be committed (initialized to 0, increases monotonically)
+last_applied = -1    # index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+
+
+# TODO: commit_index and last_applied should never == len(log), otherwise we get IndexError
+# Only place where we should be changing the state machine!!!
+# If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
+# turn log entries into state machine actions
+def commit(is_leader=False):
+    global commit_index
+    global last_applied
+    global state_machine
+    commit_range = range(last_applied + 1, commit_index + 1)
+    for i in commit_range:     # excludes last_applied, includes commit_index
+        new_val = log[i][1]
+        key = log[i][3]
+        client = log[i][4]
+        mid = log[i][5]
+        state_machine[key] = new_val
+        if is_leader:  # only the leader sends ok messages back to client
+            better_send(args.id, client, args.id, "ok", mid=mid, value=new_val)
+    last_applied = commit_index     # we've applied everything that needed to be applied
+
+
+class Follower:
+    def __init__(self, leader="FFFF", trans=False):
+        global log
+        global current_term
+        global TIMEOUT_INTERVAL
+        TIMEOUT_INTERVAL = .250 + int(args.id) * .5     # timeout intervals: range(.25, 2.25, .5)
+        self.kill = False
+        self.leader = leader  # who this replica currently believes is the leader
+        self.last_heartbeat = time.time()  # time since last heartbeat received
+        self.voted_for = None  # the replica that this replica voted for in the most recent election
+
+        if trans:
+            print("Replica %s transitioned to follower" % args.id, flush=True)
+        else:
+            print("Replica %s starting up" % args.id, flush=True)
+            hello = {"src": args.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello", "term": current_term}
+            send(hello)
+            print("Sent hello message: %s" % hello, flush=True)
+        if args.id == "0001" and self.leader == "FFFF" and time.time() - START < 5:  # hardcode the first election for efficiency
+            time.sleep(.05)  # MUST HAVE THIS so we don't send a message to a replica before its booted up
+            self.kill = True
+            current_term += 1
+            Leader().run()
+
+    def run(self):
+        while self.kill is False:
+            readable, writable, errorable = select.select([SOCKET], [], [], .01)
+            for sock in readable:
+                msg = json.loads(sock.recvfrom(65535)[0].decode('utf-8'))
+                print("%s Received message '%s'" % (args.id, msg,), flush=True)
+                self.parse_args(msg)
+                commit()
+
+    def parse_args(self, msg):
+        if msg.get('type') == 'get' or msg.get('type') == 'put':  # redirect if we receive get or put
+            better_send(args.id, msg.get('src'), self.leader, "redirect", mid=msg.get('MID'), term=current_term,
+                        value=msg.get('value'))
+
+        # timeout interval: 150-300ms
+        if time.time() - self.last_heartbeat > TIMEOUT_INTERVAL + (random.random() * TIMEOUT_INTERVAL):
+            if time.time() - START < 5.1:  # don't timeout in the first 5 seconds (saves on packet overhead)
+                self.last_heartbeat = time.time()
+            else:
+                self.kill = True
+                print("Replica %s did not receive a heartbeat in %s seconds" %
+                      (args.id, time.time() - self.last_heartbeat), flush=True)
+                Candidate().run()
+
+        # if we receive an AppendEntries
+        if msg.get('type') == "AppendEntries":
+            self.append_entry_response(msg)
+
+        # if we receive a voteRequest
+        if msg.get('type') == 'voteRequest':
+            self.vote(msg)
+
+    # what to do when we receive an AppendEntries - respond with success=True/False
+    def append_entry_response(self, msg):
+        global current_term
+        global log
+        global commit_index
+        success = True      # will only be false on two conditions
+
+        if msg.get('term') < current_term:  # not from the real leader
+            #print('message is not from real leader!', flush=True)
+            success = False
+        else:                               # valid AppendEntries, set term/leader/heartbeat accordingly
+            current_term = msg.get('term')
+            self.leader = msg.get('leader')
+            self.last_heartbeat = time.time()
+
+        if len(msg.get('entries')) == 0:  #  == [] if there are no entries to append, don't do anything
+            return
+        if msg.get('entries')[-1] in log:    # check for duplicates
+            #print("Duplicate appendEntries", flush=True)
+            return
+        leader_entries = msg.get('entries')
+        prev_index = msg.get('prev_index')
+        #print("prev index: %s, my log length: %s" % (prev_index, len(log)), flush=True)
+        if prev_index is not None and len(log) > 0:     # Consistency check
+            try:
+                if log[prev_index-1][0] != msg.get('prev_term'):
+                    success = False
+            except IndexError:
+                success = False
+        if prev_index < len(log):   # if there are any conflicting entries, replace w/ leader's log
+            log = log[:prev_index]
+        if success:     # we're chilling, add entries to log
+            for entry in leader_entries:
+                if entry not in log:
+                    log.append(entry)
+                    self.last_heartbeat = time.time()
+        # so that the follower doesn't set its commit index past its log length
+        if msg.get('leader_commit') > commit_index:
+            commit_index = min(msg.get('leader_commit'), len(log) - 1)
+        # no matter what happens, send an EntryResponse
+        # tell the leader your log length so they can properly update their match_index[]
+        better_send(args.id, msg.get('src'), self.leader, "EntryResponse", term=current_term, success=success,
+                    follower_commit=(len(log) - 1))
+
+    # vote yes if their term is higher, voted_for is null or candidateId, and their log is up-to-date, else vote no
+    def vote(self, msg):
+        self.last_heartbeat = time.time()
+        if msg.get('term', 0) < current_term:
+            better_send(args.id, msg.get('src'), self.leader, "voteNo", term=current_term)
+            return
+        try:
+            our_term = log[-1][0]
+        except IndexError:
+            our_term = 0
+        # if the logs have last entries w/ different terms, the one with the later term is more up-to-date
+        if msg.get('prev_term') > our_term:
+            up_to_date = True
+        elif msg.get('prev_term') < our_term:
+            up_to_date = False
+        else:   # if the last entries have the same term, the candidate's log must be at least as long as ours
+            up_to_date = msg.get('prev_index') >= len(log)
+        if (self.voted_for is None or self.voted_for == msg.get('src')) and up_to_date:
+            self.voted_for = msg.get('src')
+            #print("Replica %s votes for %s" % (args.id, self.voted_for), flush=True)
+            better_send(args.id, msg.get('src'), self.leader, "voteYes", term=current_term)
+        else:
+            better_send(args.id, msg.get('src'), self.leader, "voteNo", term=current_term)
+
+
+class Candidate:
+    def __init__(self):  # doesn't have self.leader, uses "FFFF" for redirects
+        global cluster_count
+        global current_term
+        cluster_count = len(list(args.others)) + 1
+        self.kill = False
+
+        current_term += 1
+        self.election_timeout = time.time()  # time since election started (is set to time when election starts)
+        self.votes = {args.id: True}     # Map of {id, voteGranted?}
+        for id in list(args.others):
+            self.votes[id] = False
+        self.yes_votes = 1  # the number of votes this has so far (starts at 1 because you always vote for yourself)
+        self.no_votes = 0
+
+        print("Replica %s transitioned to candidate" % args.id, flush=True)
+        try:
+            prev = log[-1][0]
+        except IndexError:
+            prev = 1
+        better_send(args.id, BROADCAST, 'FFFF', "voteRequest", term=current_term, prev_index=len(log),
+                    prev_term=prev)
+
+    def run(self):
+        while self.kill is False:
+            readable, writable, errorable = select.select([SOCKET], [], [], .01)
+            for sock in readable:
+                msg = json.loads(sock.recvfrom(65535)[0].decode('utf-8'))
+                print("%s Received message '%s'" % (args.id, msg,), flush=True)
+                self.parse_args(msg)
+                commit()
+
+    def parse_args(self, msg):
+        global current_term
+        # if we ever get a message with a higher term, convert to follower
+        if msg.get('term', 0) >= current_term:
+            current_term = msg.get('term')
+            self.kill = True
+            Follower(msg.get('leader'), trans=True).run()
+            return
+
+        if msg.get('type') == 'get' or msg.get('type') == 'put':
+            better_send(args.id, msg.get('src'), "FFFF", "redirect", mid=msg.get('MID'), term=current_term,
+                        value=msg.get('value'))
+
+        # if you timeout, restart the election
+        if time.time() - self.election_timeout > TIMEOUT_INTERVAL + (random.random() * TIMEOUT_INTERVAL):  # changed from .5 to 1
+            self.kill = True
+            print("Replica %s restarted its election" % args.id, flush=True)
+            Candidate().run()  # could optimize
+
+        if msg.get('type') == 'voteYes':  # could check that we're not getting duplicate yeses
+            self.votes[msg.get('src')] = True
+            print("YES vote!! Candidate %s: %s" % (args.id, self.votes), flush=True)
+            yes_votes = 0
+            for id in self.votes.keys():
+                if self.votes.get(id):
+                    yes_votes += 1
+            if yes_votes > (cluster_count / 2):
+                self.kill = True
+                print("Candidate %s won the election!" % args.id, flush=True)
+                Leader().run()
+            self.yes_votes += 1
+
+
+class Leader:
+    def __init__(self):
+        global cluster_count
+        global commit_index
+        global log
+        global current_term
+        cluster_count = len(list(args.others)) + 1
+        self.heartbeat = 0 + time.time()  # how long it's been since this server last sent a message
+        self.kill = False
+        self.timeouts = {}
+
+        self.next_index = {}  # for each server, index of the next log entry to send to that server
+        self.match_index = {}  # for each server, index of the highest log entry known to be replicated on that server
+        for id in list(args.others):    # Index errors since RAFT indexes from 1 and python indexes from 0
+            self.next_index[id] = len(log)
+            self.match_index[id] = 0
+        print("Replica %s transitioned to LEADER, term %s" % (args.id, current_term), flush=True)
+        if time.time() - START > 4.85:
+            better_send(args.id, BROADCAST, args.id, "AppendEntries", term=current_term)  # send first heartbeat
+
+    # send a heartbeat every .075 seconds, but not within the first 5 seconds (saves on packet overhead)
+    def check_heartbeat(self):
+        if time.time() - self.heartbeat >= HEARTBEAT_INTERVAL:
+            if time.time() - START < 4.85:
+                pass
+            else:
+                better_send(args.id, BROADCAST, args.id, "AppendEntries", term=current_term)
+                print("Sent a heartbeat after %s seconds" % (time.time() - self.heartbeat), flush=True)
+                self.heartbeat = 0 + time.time()
+
+    # issue: we send an Append but it takes a while to receive the response,
+    # so we send the same one again in the meantime, then we get two duplicate responses and update match_index too much
+    def run(self):
+        while self.kill is False:
+            readable, writable, errorable = select.select([SOCKET], [], [], .01)
+            for sock in readable:
+                msg = json.loads(sock.recvfrom(65535)[0].decode('utf-8'))
+                self.timeouts[msg.get('src')] = time.time()
+                print("%s Received message '%s'" % (args.id, msg,), flush=True)
+                #print("Parsing args", flush=True)
+                self.parse_args(msg)
+                #print("Updating commit index", flush=True)
+                self.update_commit_index()
+                #print("Sending append entries", flush=True)
+                self.send_appends(msg.get('src'))
+
+                #print("Checking commit", flush=True)
+                commit(is_leader=True)
+            self.check_heartbeat()
+
+    def parse_args(self, msg):
+        # if we ever get a message with a higher term, convert to follower
+        if msg.get('term', 0) > current_term:
+            self.kill = True
+            print("Replica %s saw a replica with a higher team and recognized a new leader" % args.id, flush=True)
+            Follower(msg.get('leader')).run()
+
+        # try to get the key, if it doesn't exist, respond w/ fail (maybe ok instead)
+        if msg.get('type') == 'get':
+            value = state_machine.get(msg.get('key'), "")
+            better_send(args.id, msg.get('src'), args.id, "ok", mid=msg.get('MID'), value=value, term=current_term)
+
+        # if we get a put, append that to log (respond with ok once we commit it)
+        if msg.get('type') == 'put':
+            key = msg.get('key')
+            new_val = msg.get('value')
+            prev_val = state_machine.get(key, None)  # if it's a new dict entry there will be no previous value
+            client = msg.get('src')
+            mid = msg.get('MID')
+            entry = (current_term, new_val, prev_val, key, client, mid)
+
+            log.append(entry)
+
+        # Process a response to AppendEntries based on whether it was successful
+        if msg.get('type') == 'EntryResponse':
+            follower = msg.get('src')      # which follower sent us this message
+            if msg.get('success'):      # update next_index and match_index for that follower
+                self.match_index[follower] = msg.get('follower_commit')
+                self.next_index[follower] += 1
+            else:                       # decrement next_index and retry the AppendEntries
+                entries = log[msg.get('follower_commit'): msg.get('follower_commit') + 10]
+                self.next_index[follower] -= 1
+                better_send(args.id, follower, args.id, "AppendEntries", term=current_term, entries=entries,
+                            prev_index=self.next_index[follower], prev_term=log[self.next_index[follower]-1][0],
+                            leader_commit=commit_index)
+
+    # check to see if any followers need log entries, if so, send accordingly
+    def send_appends(self, src):
+        print("Match Index: %s  Next Index: %s  Last Applied: %s  Commit Index: %s" %
+              (self.match_index, self.next_index, last_applied, commit_index), flush=True)
+        for follower in list(self.next_index.keys()):
+            if len(log) >= self.next_index[follower] and time.time() - self.timeouts[src] < 7:   # if our last log index >= next index for a follower
+                start_index = self.next_index[follower]
+                # to avoid sending too many entries to a crashed/laggy follower
+                entries = log[max(start_index, last_applied): max(start_index, last_applied) + 10]
+                if len(entries) > 0:   # don't send an empty message, just wait for heartbeat
+                    print("last applied: %s commit index: %s" % (last_applied, commit_index))
+                    print("Sent Append to %s starting at index %s (number of entries: %s)" %
+                          (follower, max(start_index, last_applied), len(entries)), flush=True)
+                    better_send(args.id, follower, args.id, "AppendEntries", term=current_term, entries=entries,
+                                prev_index=start_index-1, prev_term=log[start_index-1][0], leader_commit=commit_index)
+                    # if a majority of followers received log[i], don't send it again
+
+    # If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+    # set commitIndex = N
+    def update_commit_index(self):
+        global commit_index
+        values = list(self.match_index.values())
+        values.append(len(log))
+        values.sort()  # match_index values sorted highest-lowest
+
+        # the list is sorted, so the median will be the highest value less than or equal to a majority
+        if len(log) > 0:
+            N = values[math.floor((len(values) - 1) / 2)]
+            if log[N-1][0] == current_term:
+                commit_index = N - 1
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Follower()
+    cluster_count = len(list(args.others)) + 1
+    replica.run()
