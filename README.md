@@ -1,3 +1,9 @@
+# Project 6 for CS3700, April 2023
+## Description
+This project was to build a distributed, replicated key-value database that supports two API calls from clients: put(value, key), and get(value). Like projects 3 and 4, this was run in a simulator that replicates all sorts of errors/unreliabilities on the Internet. The simulator ran our program five times to represent five replicas, and we had to implement the RAFT protocol for fault tolerance and consensus. We were also graded on how quickly our program responded to clients, and how little packet overhead we had. 
+Raft is a consensus algorithm designed as a practical implementation of Paxos that is easy to understand, and proven safe. Raft achieves consensus by having the replicas elect a leader replica, which processes requests from clients and tells the followers what to do. Various safety mechanisms ensure tolerance against network partitions, leader failures, and unreliable networks. 
+
+## Approach
 We started this assignment by reading the RAFT paper and taking notes, trying to understand the high level concepts
 and then how that would translate into this assignment. For the milestone, we had very basic code that passed the tests,
 and then started following the implementation steps from the assignment page. Overall, we implemented almost every 
